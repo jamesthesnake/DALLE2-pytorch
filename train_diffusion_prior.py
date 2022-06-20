@@ -1,212 +1,426 @@
+# TODO: add start, num_data_points, eval_every and group to config
+# TODO: switch back to repo's wandb
+
+START = 0
+NUM_DATA_POINTS = 250e6
+EVAL_EVERY = 1000
+GROUP = "distributed"
+
 import os
-import math
-import argparse
+import click
+import wandb
 
 import torch
 from torch import nn
-from embedding_reader import EmbeddingReader
-from dalle2_pytorch import DiffusionPrior, DiffusionPriorNetwork
-from dalle2_pytorch.optimizer import get_optimizer
+from torch.utils.data import DataLoader
 
-import time
-from tqdm import tqdm
+import numpy as np
 
-import wandb
-os.environ["WANDB_SILENT"] = "true"
+from accelerate import Accelerator
 
-def eval_model(model,device,image_reader,text_reader,start,end,batch_size,loss_type,phase="Validation"):
-    model.eval()
+from dalle2_pytorch.dataloaders import get_reader, make_splits
+from dalle2_pytorch.utils import Timer
+from dalle2_pytorch.train_configs import (
+    DiffusionPriorTrainConfig,
+    TrainDiffusionPriorConfig,
+)
+from dalle2_pytorch.trackers import BaseTracker, WandbTracker
+from dalle2_pytorch import DiffusionPriorTrainer
+
+
+# helpers
+
+
+cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+
+
+def exists(val):
+    return val is not None
+
+
+def make_model(
+    prior_config, train_config, device: str = None, accelerator: Accelerator = None
+):
+    # create model from config
+    diffusion_prior = prior_config.create()
+
+    # instantiate the trainer
+    trainer = DiffusionPriorTrainer(
+        diffusion_prior=diffusion_prior,
+        lr=train_config.lr,
+        wd=train_config.wd,
+        max_grad_norm=train_config.max_grad_norm,
+        amp=train_config.amp,
+        use_ema=train_config.use_ema,
+        device=device,
+        accelerator=accelerator,
+    )
+
+    return trainer
+
+
+# eval functions
+
+
+def eval_model(
+    trainer: DiffusionPriorTrainer,
+    dataloader: DataLoader,
+    text_conditioned: bool,
+    loss_type: str,
+    tracker_context: str,
+    tracker: BaseTracker = None,
+    use_ema: bool = True,
+):
+    trainer.eval()
+    if trainer.is_main_process():
+        click.secho(f"Measuring performance on {tracker_context}", fg="green", blink=True)
+
     with torch.no_grad():
-        for emb_images,emb_text in zip(image_reader(batch_size=batch_size, start=start, end=end),
-                text_reader(batch_size=batch_size, start=start, end=end)):
-            emb_images_tensor = torch.tensor(emb_images[0]).to(device)
-            emb_text_tensor = torch.tensor(emb_text[0]).to(device)
-            loss = model(text_embed = emb_text_tensor, image_embed = emb_images_tensor)
+        total_loss = 0.0
+        total_samples = 0.0
 
-            # Log to wandb
-            wandb.log({f'{phase} {loss_type}': loss})
+        for image_embeddings, text_data in dataloader:
+            image_embeddings = image_embeddings.to(trainer.device)
+            text_data = text_data.to(trainer.device)
 
-def save_model(save_path,state_dict):
-    # Saving State Dict
-    print("====================================== Saving checkpoint ======================================")
-    torch.save(state_dict, save_path+'/'+str(time.time())+'_saved_model.pth')
+            batches = image_embeddings.shape[0]
 
-def train(image_embed_dim,
-          image_embed_url,
-          text_embed_url,
-          batch_size,
-          train_percent,
-          val_percent,
-          test_percent,
-          num_epochs,
-          dp_loss_type,
-          clip,
-          dp_condition_on_text_encodings,
-          dp_timesteps,
-          dp_cond_drop_prob,
-          dpn_depth,
-          dpn_dim_head,
-          dpn_heads,
-          save_interval,
-          save_path,
-          device,
-          learning_rate=0.001,
-          max_grad_norm=0.5,
-          weight_decay=0.01):
+            input_args = dict(image_embed=image_embeddings)
 
-    # DiffusionPriorNetwork 
-    prior_network = DiffusionPriorNetwork( 
-            dim = image_embed_dim, 
-            depth = dpn_depth, 
-            dim_head = dpn_dim_head, 
-            heads = dpn_heads).to(device)
-    
-    # DiffusionPrior with text embeddings and image embeddings pre-computed
-    diffusion_prior = DiffusionPrior( 
-            net = prior_network, 
-            clip = clip, 
-            image_embed_dim = image_embed_dim, 
-            timesteps = dp_timesteps,
-            cond_drop_prob = dp_cond_drop_prob, 
-            loss_type = dp_loss_type, 
-            condition_on_text_encodings = dp_condition_on_text_encodings).to(device)
+            if text_conditioned:
+                input_args = dict(**input_args, text=text_data)
+            else:
+                input_args = dict(**input_args, text_embed=text_data)
 
-    # Get image and text embeddings from the servers
-    print("==============Downloading embeddings - image and text====================")
-    image_reader = EmbeddingReader(embeddings_folder=image_embed_url, file_format="npy")
-    text_reader  = EmbeddingReader(embeddings_folder=text_embed_url, file_format="npy")
-    num_data_points = text_reader.count
+            if use_ema:
+                loss = trainer.ema_diffusion_prior(**input_args)
+            else:
+                loss = trainer(**input_args)
 
-    # Create save_path if it doesn't exist
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
+            total_loss += loss * batches
+            total_samples += batches
 
-    ### Training code ###
-    optimizer = get_optimizer(diffusion_prior.net.parameters(), wd=weight_decay, lr=learning_rate)
-    epochs = num_epochs
+        avg_loss = total_loss / total_samples
 
-    step = 0
-    t = time.time()
+        stats = {f"{tracker_context}-{loss_type}": avg_loss}
+        trainer.print(stats)
 
-    train_set_size = int(train_percent*num_data_points)
-    val_set_size = int(val_percent*num_data_points)
+        if exists(tracker):
+            tracker.log(stats, step=trainer.step.item() + 1)
 
-    for _ in range(epochs):
-        diffusion_prior.train()
 
-        for emb_images,emb_text in zip(image_reader(batch_size=batch_size, start=0, end=train_set_size),
-                text_reader(batch_size=batch_size, start=0, end=train_set_size)):
-            emb_images_tensor = torch.tensor(emb_images[0]).to(device)
-            emb_text_tensor = torch.tensor(emb_text[0]).to(device)
-            optimizer.zero_grad()
-            loss = diffusion_prior(text_embed = emb_text_tensor,image_embed = emb_images_tensor)
-            loss.backward()
-            # Samples per second
-            step+=1
-            samples_per_sec = batch_size*step/(time.time()-t)
-            # Save checkpoint every save_interval minutes
-            if(int(time.time()-t) >= 60*save_interval):
-                t = time.time()
-                save_model(save_path,diffusion_prior.state_dict())
-            # Log to wandb
-            wandb.log({"Training loss": loss.item(),
-                        "Steps": step,
-                        "Samples per second": samples_per_sec})
+def report_cosine_sims(
+    trainer: DiffusionPriorTrainer,
+    dataloader: DataLoader,
+    text_conditioned: bool,
+    tracker: BaseTracker,
+    tracker_context: str = "validation",
+):
+    trainer.eval()
+    if trainer.is_main_process():
+        click.secho("Measuring Cosine-Similarity", fg="green", blink=True)
 
-            nn.init.clip_grad_norm_(diffusion_prior.parameters(), max_grad_norm)
-            optimizer.step()
+    for test_image_embeddings, text_data in dataloader:
+        test_image_embeddings = test_image_embeddings.to(trainer.device)
+        text_data = text_data.to(trainer.device)
 
-        ### Evaluate model(validation run) ###
-        start = train_set_size
-        end=start+val_set_size
-        eval_model(diffusion_prior,device,image_reader,text_reader,start,end,batch_size,dp_loss_type,phase="Validation")
+        # we are text conditioned, we produce an embedding from the tokenized text
+        if text_conditioned:
+            text_embedding, text_encodings, text_mask = trainer.embed_text(text_data)
+            text_cond = dict(
+                text_embed=text_embedding, text_encodings=text_encodings, mask=text_mask
+            )
+        else:
+            text_embedding = text_data
+            text_cond = dict(text_embed=text_embedding)
 
-    ### Test run ###
-    test_set_size = int(test_percent*train_set_size) 
-    start=train_set_size+val_set_size
-    end=num_data_points
-    eval_model(diffusion_prior,device,image_reader,text_reader,start,end,batch_size,dp_loss_type,phase="Test")
+        # make a copy of the text embeddings for shuffling
+        text_embed_shuffled = text_embedding.clone()
 
-def main():
-    parser = argparse.ArgumentParser()
-    # Logging
-    parser.add_argument("--wandb-entity", type=str, default="laion")
-    parser.add_argument("--wandb-project", type=str, default="diffusion-prior")
-    parser.add_argument("--wandb-name", type=str, default="laion-dprior")
-    parser.add_argument("--wandb-dataset", type=str, default="LAION-5B")
-    parser.add_argument("--wandb-arch", type=str, default="DiffusionPrior")
-    # URLs for embeddings 
-    parser.add_argument("--image-embed-url", type=str, default="https://mystic.the-eye.eu/public/AI/cah/laion5b/embeddings/laion2B-en/img_emb/")
-    parser.add_argument("--text-embed-url", type=str, default="https://mystic.the-eye.eu/public/AI/cah/laion5b/embeddings/laion2B-en/text_emb/")
-    # Hyperparameters
-    parser.add_argument("--learning-rate", type=float, default=0.001)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--batch-size", type=int, default=10**4)
-    parser.add_argument("--num-epochs", type=int, default=5)
-    # Image embed dimension
-    parser.add_argument("--image-embed-dim", type=int, default=768)
-    # Train-test split
-    parser.add_argument("--train-percent", type=float, default=0.7)
-    parser.add_argument("--val-percent", type=float, default=0.2)
-    parser.add_argument("--test-percent", type=float, default=0.1)
-    # LAION training(pre-computed embeddings)
-    # DiffusionPriorNetwork(dpn) parameters
-    parser.add_argument("--dpn-depth", type=int, default=6)
-    parser.add_argument("--dpn-dim-head", type=int, default=64)
-    parser.add_argument("--dpn-heads", type=int, default=8)
-    # DiffusionPrior(dp) parameters
-    parser.add_argument("--dp-condition-on-text-encodings", type=bool, default=False)
-    parser.add_argument("--dp-timesteps", type=int, default=100)
-    parser.add_argument("--dp-cond-drop-prob", type=float, default=0.2)
-    parser.add_argument("--dp-loss-type", type=str, default="l2")
-    parser.add_argument("--clip", type=str, default=None)
-    # Model checkpointing interval(minutes)
-    parser.add_argument("--save-interval", type=int, default=30)
-    parser.add_argument("--save-path", type=str, default="./diffusion_prior_checkpoints")
+        # roll the text to simulate "unrelated" captions
+        rolled_idx = torch.roll(torch.arange(text_embedding.shape[0]), 1)
+        text_embed_shuffled = text_embed_shuffled[rolled_idx]
+        text_embed_shuffled = text_embed_shuffled / text_embed_shuffled.norm(
+            dim=1, keepdim=True
+        )
 
-    args = parser.parse_args()
-    print("Setting up wandb logging... Please wait...")
-    wandb.init(
-      entity=args.wandb_entity,
-      project=args.wandb_project,
-      config={
-      "learning_rate": args.learning_rate,
-      "architecture": args.wandb_arch,
-      "dataset": args.wandb_dataset,
-      "epochs": args.num_epochs,
-      })
-    print("wandb logging setup done!")
-    # Obtain the utilized device.
+        if text_conditioned:
+            text_encodings_shuffled = text_encodings[rolled_idx]
+            text_mask_shuffled = text_mask[rolled_idx]
+        else:
+            text_encodings_shuffled = None
+            text_mask_shuffled = None
 
-    has_cuda = torch.cuda.is_available()
-    if has_cuda:
-        device = torch.device("cuda:0")
-        torch.cuda.set_device(device)
+        text_cond_shuffled = dict(
+            text_embed=text_embed_shuffled,
+            text_encodings=text_encodings_shuffled,
+            mask=text_mask_shuffled,
+        )
 
-    # Training loop
-    train(args.image_embed_dim,
-          args.image_embed_url,
-          args.text_embed_url,
-          args.batch_size,
-          args.train_percent,
-          args.val_percent,
-          args.test_percent,
-          args.num_epochs,
-          args.dp_loss_type,
-          args.clip,
-          args.dp_condition_on_text_encodings,
-          args.dp_timesteps,
-          args.dp_cond_drop_prob,
-          args.dpn_depth,
-          args.dpn_dim_head,
-          args.dpn_heads,
-          args.save_interval,
-          args.save_path,
-          device,
-          args.learning_rate,
-          args.max_grad_norm,
-          args.weight_decay)
+        # prepare the text embedding
+        text_embed = text_embedding / text_embedding.norm(dim=1, keepdim=True)
+
+        # prepare image embeddings
+        test_image_embeddings = test_image_embeddings / test_image_embeddings.norm(
+            dim=1, keepdim=True
+        )
+
+        # predict on the unshuffled text embeddings
+        predicted_image_embeddings = trainer.p_sample_loop(
+            test_image_embeddings.shape, text_cond
+        )
+
+        predicted_image_embeddings = (
+            predicted_image_embeddings
+            / predicted_image_embeddings.norm(dim=1, keepdim=True)
+        )
+
+        # predict on the shuffled embeddings
+        predicted_unrelated_embeddings = trainer.p_sample_loop(
+            test_image_embeddings.shape, text_cond_shuffled
+        )
+
+        predicted_unrelated_embeddings = (
+            predicted_unrelated_embeddings
+            / predicted_unrelated_embeddings.norm(dim=1, keepdim=True)
+        )
+
+        # calculate similarities
+        original_similarity = cos(text_embed, test_image_embeddings).cpu().numpy()
+        predicted_similarity = cos(text_embed, predicted_image_embeddings).cpu().numpy()
+        unrelated_similarity = (
+            cos(text_embed, predicted_unrelated_embeddings).cpu().numpy()
+        )
+        predicted_img_similarity = (
+            cos(test_image_embeddings, predicted_image_embeddings).cpu().numpy()
+        )
+
+        stats = {
+            f"{tracker_context}/baseline similarity": np.mean(original_similarity),
+            f"{tracker_context}/similarity with text": np.mean(predicted_similarity),
+            f"{tracker_context}/similarity with original image": np.mean(
+                predicted_img_similarity
+            ),
+            f"{tracker_context}/similarity with unrelated caption": np.mean(unrelated_similarity),
+            f"{tracker_context}/difference from baseline similarity": np.mean(
+                predicted_similarity - original_similarity
+            ),
+        }
+
+        for k, v in stats.items():
+            trainer.print(f"{tracker_context}/{k}: {v}")
+
+        if exists(tracker):
+            tracker.log(stats, step=trainer.step.item() + 1)
+
+
+# training script
+
+
+def train(
+    trainer: DiffusionPriorTrainer,
+    train_loader: DataLoader,
+    eval_loader: DataLoader,
+    test_loader: DataLoader,
+    config: DiffusionPriorTrainConfig,
+):
+    # distributed tracking with wandb
+    if trainer.accelerator.num_processes > 1:
+        os.environ["WANDB_START_METHOD"] = "thread"
+
+    tracker = wandb.init(
+        name=f"RANK:{trainer.device}",
+        entity=config.tracker.wandb_entity,
+        project=config.tracker.wandb_project,
+        config=config.dict(),
+        group=GROUP,
+    )
+
+    # sync after tracker init
+    trainer.wait_for_everyone()
+
+    # init a timer
+    timer = Timer()
+
+    # do training
+    for img, txt in train_loader:
+        trainer.train()
+        current_step = trainer.step.item() + 1
+
+        # place data on device
+        img = img.to(trainer.device)
+        txt = txt.to(trainer.device)
+
+        # pass to model
+        loss = trainer(text=txt, image_embed=img)
+
+        # display & log loss (will only print from main process)
+        trainer.print(f"Step {current_step}: Loss {loss}")
+
+        # perform backprop & apply EMA updates
+        trainer.update()
+
+        # track samples/sec/rank
+        samples_per_sec = img.shape[0] / timer.elapsed()
+
+        # samples seen
+        samples_seen = (
+            config.data.batch_size * trainer.accelerator.num_processes * current_step
+        )
+
+        # ema decay
+        ema_decay = trainer.ema_diffusion_prior.get_current_decay()
+
+        # Log on all processes for debugging
+        tracker.log(
+            {
+                "tracking/samples-sec": samples_per_sec,
+                "tracking/samples-seen": samples_seen,
+                "tracking/ema-decay": ema_decay,
+                "metrics/training-loss": loss,
+            },
+            step=current_step,
+        )
+
+        # Metric Tracking & Checkpointing (outside of timer's scope)
+        if current_step % EVAL_EVERY == 0:
+            eval_model(
+                trainer=trainer,
+                dataloader=eval_loader,
+                text_conditioned=config.prior.condition_on_text_encodings,
+                loss_type=config.prior.loss_type,
+                tracker_context="metrics/online-model-validation",
+                tracker=tracker,
+                use_ema=False,
+            )
+
+            eval_model(
+                trainer=trainer,
+                dataloader=eval_loader,
+                text_conditioned=config.prior.condition_on_text_encodings,
+                loss_type=config.prior.loss_type,
+                tracker_context="metrics/ema-model-validation",
+                tracker=tracker,
+                use_ema=True,
+            )
+
+            report_cosine_sims(
+                trainer=trainer,
+                dataloader=eval_loader,
+                text_conditioned=config.prior.condition_on_text_encodings,
+                tracker=tracker,
+                tracker_context="metrics",
+            )
+
+        if current_step % config.train.save_every == 0:
+            trainer.save(f"{config.tracker.data_path}/chkpt_step_{current_step}.pth")
+
+        # reset timer for next round
+        timer.reset()
+
+    # evaluate on test data
+
+    eval_model(
+        trainer=trainer,
+        dataloader=test_loader,
+        text_conditioned=config.prior.condition_on_text_encodings,
+        loss_type=config.prior.loss_type,
+        tracker_context="test",
+        tracker=tracker,
+    )
+
+    report_cosine_sims(
+        trainer,
+        test_loader,
+        config.prior.condition_on_text_encodings,
+        tracker,
+        tracker_context="test",
+    )
+
+
+def initialize_training(config, accelerator=None):
+    """
+    Parse the configuration file, and prepare everything necessary for training
+    """
+
+    # get a device
+
+    if accelerator:
+        device = accelerator.device
+        click.secho(f"Accelerating on: {device}", fg="yellow")
+    else:
+        if torch.cuda.is_available():
+            click.secho("GPU detected, defaulting to cuda:0", fg="yellow")
+            device = "cuda:0"
+        else:
+            click.secho("No GPU detected...using cpu", fg="yellow")
+            device = "cpu"
+
+    # make the trainer (will automatically distribute if possible & configured)
+
+    trainer = make_model(config.prior, config.train, device, accelerator).to(device)
+
+    # reload from chcekpoint
+
+    if config.load.resume == True:
+        click.secho(f"Loading checkpoint: {config.load.source}", fg="cyan")
+        trainer.load(config.load.source)
+
+    # fetch and prepare data
+
+    if trainer.is_main_process():
+        click.secho("Grabbing data from source", fg="blue", blink=True)
+
+    img_reader = get_reader(
+        text_conditioned=trainer.text_conditioned,
+        img_url=config.data.image_url,
+        meta_url=config.data.meta_url,
+    )
+
+    train_loader, eval_loader, test_loader = make_splits(
+        text_conditioned=trainer.text_conditioned,
+        batch_size=config.data.batch_size,
+        num_data_points=NUM_DATA_POINTS,
+        train_split=config.data.splits.train,
+        eval_split=config.data.splits.val,
+        image_reader=img_reader,
+        rank=accelerator.state.process_index if exists(accelerator) else 0,
+        world_size=accelerator.state.num_processes if exists(accelerator) else 1,
+        start=START,
+    )
+
+    # wait for everyone to load data before continuing
+    trainer.wait_for_everyone()
+
+    # start training
+    train(
+        trainer=trainer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        test_loader=test_loader,
+        config=config,
+    )
+
+
+@click.command()
+@click.option("--hfa", default=True)
+@click.option("--config_path", default="configs/prior.json")
+def main(hfa, config_path):
+    # start HFA if requested
+    if hfa:
+        accelerator = Accelerator()
+    else:
+        accelerator = None
+
+    # load the configuration file on main process
+    if not exists(accelerator) or accelerator.is_main_process:
+        click.secho(f"Loading configuration from {config_path}", fg="green")
+
+    config = TrainDiffusionPriorConfig.from_json_path(config_path)
+
+    # send config to get processed
+    initialize_training(config, accelerator)
+
 
 if __name__ == "__main__":
-  main()
+    main()
