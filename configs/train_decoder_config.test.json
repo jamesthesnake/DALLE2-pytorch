@@ -2,41 +2,46 @@
     "decoder": {
         "unets": [
             {
-                "dim": 128,
+                "dim": 16,
                 "image_embed_dim": 768,
-                "cond_dim": 64,
+                "cond_dim": 16,
                 "channels": 3,
                 "dim_mults": [1, 2, 4, 8],
-                "attn_dim_head": 32,
-                "attn_heads": 16
+                "attn_dim_head": 16,
+                "attn_heads": 4,
+		"self_attn": [false, true, true, true]
             }
         ],
+        "clip": {
+            "make": "openai",
+            "model": "ViT-L/14"
+        },
+
+	"timesteps": 10,
         "image_sizes": [64],
         "channels": 3,
-        "timesteps": 1000,
         "loss_type": "l2",
         "beta_schedule": ["cosine"],
         "learned_variance": true
     },
     "data": {
-        "webdataset_base_url": "pipe:s3cmd get s3://bucket/path/{}.tar -",
-        "img_embeddings_url": "s3://bucket/img_embeddings/path/",
+        "webdataset_base_url": "test_data/{}.tar",
         "num_workers": 4,
-        "batch_size": 64,
+        "batch_size": 4,
         "start_shard": 0,
-        "end_shard": 9999999,
-        "shard_width": 6,
-        "index_width": 4,
+        "end_shard": 9,
+        "shard_width": 1,
+        "index_width": 1,
         "splits": {
             "train": 0.75,
             "val": 0.15,
             "test": 0.1
         },
-        "shuffle_train": true,
-        "resample_train": false,
+        "shuffle_train": false,
+        "resample_train": true,
         "preprocessing": {
             "RandomResizedCrop": {
-                "size": [128, 128],
+                "size": [224, 224],
                 "scale": [0.75, 1.0],
                 "ratio": [1.0, 1.0]
             },
@@ -44,22 +49,22 @@
         }
     },
     "train": {
-        "epochs": 20,
-        "lr": 1e-4,
+        "epochs": 1,
+        "lr": 1e-16,
         "wd": 0.01,
         "max_grad_norm": 0.5,
-        "save_every_n_samples": 100000,
-        "n_sample_images": 6,
-        "device": "cuda:0",
-        "epoch_samples": null,
-        "validation_samples": null,
+        "save_every_n_samples": 100,
+        "n_sample_images": 1,
+        "device": "cpu",
+        "epoch_samples": 50,
+        "validation_samples": 5,
         "use_ema": true,
         "ema_beta": 0.99,
         "amp": false,
         "unet_training_mask": [true]
     },
     "evaluate": {
-        "n_evaluation_samples": 1000,
+        "n_evaluation_samples": 2,
         "FID": {
             "feature": 64
         },
@@ -69,7 +74,7 @@
         },
         "KID": {
             "feature": 64,
-            "subset_size": 10
+            "subset_size": 2
         },
         "LPIPS": {
             "net_type": "vgg",
@@ -79,31 +84,17 @@
     "tracker": {
         "overwrite_data_path": true,
 
-        "log": {
-            "log_type": "wandb",
-
-            "wandb_entity": "your_wandb",
-            "wandb_project": "your_project",
-
-            "verbose": true
-        },
+	"log": {
+            "log_type": "console"
+	},
 
         "load": {
             "load_from": null
         },
 
-        "save": [{
-            "save_to": "wandb",
+       "save": [{
+            "save_to": "local",
             "save_latest_to": "latest.pth"
-        }, {
-            "save_to": "huggingface",
-            "huggingface_repo": "Veldrovive/test_model",
-
-            "save_latest_to": "path/to/model_dir/latest.pth",
-            "save_best_to": "path/to/model_dir/best.pth",
-            "save_meta_to": "path/to/directory/for/assorted/files",
-
-            "save_type": "model"
         }]
     }
 }

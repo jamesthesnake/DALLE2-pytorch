@@ -1,19 +1,23 @@
 from pathlib import Path
+from typing import List
+from datetime import timedelta
 
 from dalle2_pytorch.trainer import DecoderTrainer
 from dalle2_pytorch.dataloaders import create_image_embedding_dataloader
-from dalle2_pytorch.trackers import WandbTracker, ConsoleTracker, DummyTracker
-from dalle2_pytorch.train_configs import TrainDecoderConfig
+from dalle2_pytorch.trackers import Tracker
+from dalle2_pytorch.train_configs import DecoderConfig, TrainDecoderConfig
 from dalle2_pytorch.utils import Timer, print_ribbon
-from dalle2_pytorch.dalle2_pytorch import resize_image_to
+from dalle2_pytorch.dalle2_pytorch import Decoder, resize_image_to
+from clip import tokenize
 
 import torchvision
 import torch
+from torch import nn
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
 from torchmetrics.image.kid import KernelInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import dataclasses as accelerate_dataclasses
 import webdataset as wds
 import click
@@ -33,7 +37,8 @@ def exists(val):
 def create_dataloaders(
     available_shards,
     webdataset_base_url,
-    embeddings_url,
+    img_embeddings_url=None,
+    text_embeddings_url=None,
     shard_width=6,
     num_workers=4,
     batch_size=32,
@@ -63,14 +68,15 @@ def create_dataloaders(
     test_urls = [webdataset_base_url.format(str(shard).zfill(shard_width)) for shard in test_split]
     val_urls = [webdataset_base_url.format(str(shard).zfill(shard_width)) for shard in val_split]
     
-    create_dataloader = lambda tar_urls, shuffle=False, resample=False, with_text=False, for_sampling=False: create_image_embedding_dataloader(
+    create_dataloader = lambda tar_urls, shuffle=False, resample=False, for_sampling=False: create_image_embedding_dataloader(
         tar_url=tar_urls,
         num_workers=num_workers,
         batch_size=batch_size if not for_sampling else n_sample_images,
-        embeddings_url=embeddings_url,
+        img_embeddings_url=img_embeddings_url,
+        text_embeddings_url=text_embeddings_url,
         index_width=index_width,
         shuffle_num = None,
-        extra_keys= ["txt"] if with_text else [],
+        extra_keys= ["txt"],
         shuffle_shards = shuffle,
         resample_shards = resample, 
         img_preproc=img_preproc,
@@ -79,8 +85,8 @@ def create_dataloaders(
 
     train_dataloader = create_dataloader(train_urls, shuffle=shuffle_train, resample=resample_train)
     train_sampling_dataloader = create_dataloader(train_urls, shuffle=False, for_sampling=True)
-    val_dataloader = create_dataloader(val_urls, shuffle=False, with_text=True)
-    test_dataloader = create_dataloader(test_urls, shuffle=False, with_text=True)
+    val_dataloader = create_dataloader(val_urls, shuffle=False)
+    test_dataloader = create_dataloader(test_urls, shuffle=False)
     test_sampling_dataloader = create_dataloader(test_urls, shuffle=False, for_sampling=True)
     return {
         "train": train_dataloader,
@@ -104,54 +110,83 @@ def get_example_data(dataloader, device, n=5):
     Samples the dataloader and returns a zipped list of examples
     """
     images = []
-    embeddings = []
+    img_embeddings = []
+    text_embeddings = []
     captions = []
-    dataset_keys = get_dataset_keys(dataloader)
-    has_caption = "txt" in dataset_keys
-    for data in dataloader:
-        if has_caption:
-            img, emb, txt = data
+    for img, emb, txt in dataloader:
+        img_emb, text_emb = emb.get('img'), emb.get('text')
+        if img_emb is not None:
+            img_emb = img_emb.to(device=device, dtype=torch.float)
+            img_embeddings.extend(list(img_emb))
         else:
-            img, emb = data
-            txt = [""] * emb.shape[0]
+            # Then we add None img.shape[0] times
+            img_embeddings.extend([None]*img.shape[0])
+        if text_emb is not None:
+            text_emb = text_emb.to(device=device, dtype=torch.float)
+            text_embeddings.extend(list(text_emb))
+        else:
+            # Then we add None img.shape[0] times
+            text_embeddings.extend([None]*img.shape[0])
         img = img.to(device=device, dtype=torch.float)
-        emb = emb.to(device=device, dtype=torch.float)
         images.extend(list(img))
-        embeddings.extend(list(emb))
         captions.extend(list(txt))
         if len(images) >= n:
             break
-    return list(zip(images[:n], embeddings[:n], captions[:n]))
+    return list(zip(images[:n], img_embeddings[:n], text_embeddings[:n], captions[:n]))
 
-def generate_samples(trainer, example_data, text_prepend=""):
+def generate_samples(trainer, example_data, clip=None, start_unet=1, end_unet=None, condition_on_text_encodings=False, cond_scale=1.0, device=None, text_prepend="", match_image_size=True):
     """
     Takes example data and generates images from the embeddings
     Returns three lists: real images, generated images, and captions
     """
-    real_images, embeddings, txts = zip(*example_data)
-    embeddings_tensor = torch.stack(embeddings)
-    samples = trainer.sample(embeddings_tensor)
+    real_images, img_embeddings, text_embeddings, txts = zip(*example_data)
+    sample_params = {}
+    if img_embeddings[0] is None:
+        # Generate image embeddings from clip
+        imgs_tensor = torch.stack(real_images)
+        assert clip is not None, "clip is None, but img_embeddings is None"
+        imgs_tensor.to(device=device)
+        img_embeddings, img_encoding = clip.embed_image(imgs_tensor)
+        sample_params["image_embed"] = img_embeddings
+    else:
+        # Then we are using precomputed image embeddings
+        img_embeddings = torch.stack(img_embeddings)
+        sample_params["image_embed"] = img_embeddings
+    if condition_on_text_encodings:
+        if text_embeddings[0] is None:
+            # Generate text embeddings from text
+            assert clip is not None, "clip is None, but text_embeddings is None"
+            tokenized_texts = tokenize(txts, truncate=True)
+            text_embed, text_encodings = clip.embed_text(tokenized_texts)
+            sample_params["text_encodings"] = text_encodings
+        else:
+            # Then we are using precomputed text embeddings
+            text_embeddings = torch.stack(text_embeddings)
+            sample_params["text_encodings"] = text_embeddings
+    sample_params["start_at_unet_number"] = start_unet
+    sample_params["stop_at_unet_number"] = end_unet
+    if start_unet > 1:
+        # If we are only training upsamplers
+        sample_params["image"] = torch.stack(real_images)
+    if device is not None:
+        sample_params["_device"] = device
+    samples = trainer.sample(**sample_params, _cast_deepspeed_precision=False)  # At sampling time we don't want to cast to FP16
     generated_images = list(samples)
     captions = [text_prepend + txt for txt in txts]
+    if match_image_size:
+        generated_image_size = generated_images[0].shape[-1]
+        real_images = [resize_image_to(image, generated_image_size, clamp_range=(0, 1)) for image in real_images]
     return real_images, generated_images, captions
 
-def generate_grid_samples(trainer, examples, text_prepend=""):
+def generate_grid_samples(trainer, examples, clip=None, start_unet=1, end_unet=None, condition_on_text_encodings=False, cond_scale=1.0, device=None, text_prepend=""):
     """
     Generates samples and uses torchvision to put them in a side by side grid for easy viewing
     """
-    real_images, generated_images, captions = generate_samples(trainer, examples, text_prepend)
-
-    real_image_size = real_images[0].shape[-1]
-    generated_image_size = generated_images[0].shape[-1]
-
-    # training images may be larger than the generated one
-    if real_image_size > generated_image_size:
-        real_images = [resize_image_to(image, generated_image_size) for image in real_images]
-
+    real_images, generated_images, captions = generate_samples(trainer, examples, clip, start_unet, end_unet, condition_on_text_encodings, cond_scale, device, text_prepend)
     grid_images = [torchvision.utils.make_grid([original_image, generated_image]) for original_image, generated_image in zip(real_images, generated_images)]
     return grid_images, captions
                     
-def evaluate_trainer(trainer, dataloader, device, n_evaluation_samples=1000, FID=None, IS=None, KID=None, LPIPS=None):
+def evaluate_trainer(trainer, dataloader, device, start_unet, end_unet, clip=None, condition_on_text_encodings=False, cond_scale=1.0, inference_device=None, n_evaluation_samples=1000, FID=None, IS=None, KID=None, LPIPS=None):
     """
     Computes evaluation metrics for the decoder
     """
@@ -161,7 +196,7 @@ def evaluate_trainer(trainer, dataloader, device, n_evaluation_samples=1000, FID
     if len(examples) == 0:
         print("No data to evaluate. Check that your dataloader has shards.")
         return metrics
-    real_images, generated_images, captions = generate_samples(trainer, examples)
+    real_images, generated_images, captions = generate_samples(trainer, examples, clip, start_unet, end_unet, condition_on_text_encodings, cond_scale, inference_device)
     real_images = torch.stack(real_images).to(device=device, dtype=torch.float)
     generated_images = torch.stack(generated_images).to(device=device, dtype=torch.float)
     # Convert from [0, 1] to [0, 255] and from torch.float to torch.uint8
@@ -213,43 +248,38 @@ def evaluate_trainer(trainer, dataloader, device, n_evaluation_samples=1000, FID
             metrics[metric_name] = metrics_tensor[i].item()
     return metrics
 
-def save_trainer(tracker, trainer, epoch, sample, next_task, validation_losses, relative_paths):
+def save_trainer(tracker: Tracker, trainer: DecoderTrainer, epoch: int, sample: int, next_task: str, validation_losses: List[float], samples_seen: int, is_latest=True, is_best=False):
     """
     Logs the model with an appropriate method depending on the tracker
     """
-    if isinstance(relative_paths, str):
-        relative_paths = [relative_paths]
-    for relative_path in relative_paths:
-        local_path = str(tracker.data_path / relative_path)
-        trainer.save(local_path, epoch=epoch, sample=sample, next_task=next_task, validation_losses=validation_losses)
-        tracker.save_file(local_path)
+    tracker.save(trainer, is_best=is_best, is_latest=is_latest, epoch=epoch, sample=sample, next_task=next_task, validation_losses=validation_losses, samples_seen=samples_seen)
     
-def recall_trainer(tracker, trainer, recall_source=None, **load_config):
+def recall_trainer(tracker: Tracker, trainer: DecoderTrainer):
     """
     Loads the model with an appropriate method depending on the tracker
     """
-    trainer.accelerator.print(print_ribbon(f"Loading model from {recall_source}"))
-    local_filepath = tracker.recall_file(recall_source, **load_config)
-    state_dict = trainer.load(local_filepath)
-    return state_dict.get("epoch", 0), state_dict.get("validation_losses", []), state_dict.get("next_task", "train"), state_dict.get("sample", 0)
+    trainer.accelerator.print(print_ribbon(f"Loading model from {type(tracker.loader).__name__}"))
+    state_dict = tracker.recall()
+    trainer.load_state_dict(state_dict, only_model=False, strict=True)
+    return state_dict.get("epoch", 0), state_dict.get("validation_losses", []), state_dict.get("next_task", "train"), state_dict.get("sample", 0), state_dict.get("samples_seen", 0)
 
 def train(
     dataloaders,
-    decoder,
-    accelerator,
-    tracker,
+    decoder: Decoder,
+    accelerator: Accelerator,
+    tracker: Tracker,
     inference_device,
-    load_config=None,
+    clip=None,
     evaluate_config=None,
     epoch_samples = None,  # If the training dataset is resampling, we have to manually stop an epoch
     validation_samples = None,
+    save_immediately=False,
     epochs = 20,
     n_sample_images = 5,
     save_every_n_samples = 100000,
-    save_all=False,
-    save_latest=True,
-    save_best=True,
     unet_training_mask=None,
+    condition_on_text_encodings=False,
+    cond_scale=1.0,
     **kwargs
 ):
     """
@@ -257,9 +287,25 @@ def train(
     """
     is_master = accelerator.process_index == 0
 
+    if not exists(unet_training_mask):
+        # Then the unet mask should be true for all unets in the decoder
+        unet_training_mask = [True] * len(decoder.unets)
+    assert len(unet_training_mask) == len(decoder.unets), f"The unet training mask should be the same length as the number of unets in the decoder. Got {len(unet_training_mask)} and {trainer.num_unets}"
+    trainable_unet_numbers = [i+1 for i, trainable in enumerate(unet_training_mask) if trainable]
+    first_trainable_unet = trainable_unet_numbers[0]
+    last_trainable_unet = trainable_unet_numbers[-1]
+    def move_unets(unet_training_mask):
+        for i in range(len(decoder.unets)):
+            if not unet_training_mask[i]:
+                # Replace the unet from the module list with a nn.Identity(). This training script never uses unets that aren't being trained so this is fine.
+                decoder.unets[i] = nn.Identity().to(inference_device)
+    # Remove non-trainable unets
+    move_unets(unet_training_mask)
+
     trainer = DecoderTrainer(
-        accelerator,
-        decoder,
+        decoder=decoder,
+        accelerator=accelerator,
+        dataloaders=dataloaders,
         **kwargs
     )
 
@@ -268,23 +314,19 @@ def train(
     validation_losses = []
     next_task = 'train'
     sample = 0
+    samples_seen = 0
     val_sample = 0
-    step = lambda: int(trainer.step.item())
+    step = lambda: int(trainer.num_steps_taken(unet_number=first_trainable_unet))
 
-    if exists(load_config) and exists(load_config.source):
-        start_epoch, validation_losses, next_task, recalled_sample = recall_trainer(tracker, trainer, recall_source=load_config.source, **load_config.dict())
+    if tracker.can_recall:
+        start_epoch, validation_losses, next_task, recalled_sample, samples_seen = recall_trainer(tracker, trainer)
         if next_task == 'train':
             sample = recalled_sample
         if next_task == 'val':
             val_sample = recalled_sample
-        accelerator.print(f"Loaded model from {load_config.source} on epoch {start_epoch} with minimum validation loss {min(validation_losses) if len(validation_losses) > 0 else 'N/A'}")
+        accelerator.print(f"Loaded model from {type(tracker.loader).__name__} on epoch {start_epoch} having seen {samples_seen} samples with minimum validation loss {min(validation_losses) if len(validation_losses) > 0 else 'N/A'}")
         accelerator.print(f"Starting training from task {next_task} at sample {sample} and validation sample {val_sample}")
     trainer.to(device=inference_device)
-
-    if not exists(unet_training_mask):
-        # Then the unet mask should be true for all unets in the decoder
-        unet_training_mask = [True] * trainer.num_unets
-    assert len(unet_training_mask) == trainer.num_unets, f"The unet training mask should be the same length as the number of unets in the decoder. Got {len(unet_training_mask)} and {trainer.num_unets}"
 
     accelerator.print(print_ribbon("Generating Example Data", repeat=40))
     accelerator.print("This can take a while to load the shard lists...")
@@ -306,13 +348,22 @@ def train(
         last_snapshot = sample
 
         if next_task == 'train':
-            for i, (img, emb) in enumerate(dataloaders["train"]):
+            for i, (img, emb, txt) in enumerate(dataloaders["train"]):
                 # We want to count the total number of samples across all processes
                 sample_length_tensor[0] = len(img)
                 all_samples = accelerator.gather(sample_length_tensor)  # TODO: accelerator.reduce is broken when this was written. If it is fixed replace this.
                 total_samples = all_samples.sum().item()
                 sample += total_samples
-                img, emb = send_to_device((img, emb))
+                samples_seen += total_samples
+                img_emb = emb.get('img')
+                has_img_embedding = img_emb is not None
+                if has_img_embedding:
+                    img_emb, = send_to_device((img_emb,))
+                text_emb = emb.get('text')
+                has_text_embedding = text_emb is not None
+                if has_text_embedding:
+                    text_emb, = send_to_device((text_emb,))
+                img, = send_to_device((img,))
 
                 trainer.train()
                 for unet in range(1, trainer.num_unets+1):
@@ -320,7 +371,25 @@ def train(
                     if not unet_training_mask[unet-1]: # Unet index is the unet number - 1
                         continue
 
-                    loss = trainer.forward(img, image_embed=emb, unet_number=unet)
+                    forward_params = {}
+                    if has_img_embedding:
+                        forward_params['image_embed'] = img_emb
+                    else:
+                        # Forward pass automatically generates embedding
+                        assert clip is not None
+                        img_embed, img_encoding = clip.embed_image(img)
+                        forward_params['image_embed'] = img_embed
+                    if condition_on_text_encodings:
+                        if has_text_embedding:
+                            forward_params['text_encodings'] = text_emb
+                        else:
+                            # Then we need to pass the text instead
+                            assert clip is not None
+                            tokenized_texts = tokenize(txt, truncate=True).to(inference_device)
+                            assert tokenized_texts.shape[0] == len(img), f"The number of texts ({tokenized_texts.shape[0]}) should be the same as the number of images ({len(img)})"
+                            text_embed, text_encodings = clip.embed_text(tokenized_texts)
+                            forward_params['text_encodings'] = text_encodings
+                    loss = trainer.forward(img, **forward_params, unet_number=unet, _device=inference_device)
                     trainer.update(unet_number=unet)
                     unet_losses_tensor[i % TRAIN_CALC_LOSS_EVERY_ITERS, unet-1] = loss
                 
@@ -333,32 +402,33 @@ def train(
                     unet_all_losses = accelerator.gather(unet_losses_tensor)
                     mask = unet_all_losses != 0
                     unet_average_loss = (unet_all_losses * mask).sum(dim=0) / mask.sum(dim=0)
-                    loss_map = { f"Unet {index} Training Loss": loss.item() for index, loss in enumerate(unet_average_loss) if loss != 0 }
+                    loss_map = { f"Unet {index} Training Loss": loss.item() for index, loss in enumerate(unet_average_loss) if unet_training_mask[index] }
+
+                    # gather decay rate on each UNet
+                    ema_decay_list = {f"Unet {index} EMA Decay": ema_unet.get_current_decay() for index, ema_unet in enumerate(trainer.ema_unets) if unet_training_mask[index]}
+
                     log_data = {
                         "Epoch": epoch,
                         "Sample": sample,
                         "Step": i,
                         "Samples per second": samples_per_sec,
+                        "Samples Seen": samples_seen,
+                        **ema_decay_list,
                         **loss_map
                     }
-                    # print(f"I am rank {accelerator.state.process_index}. Example weight: {trainer.decoder.state_dict()['module.unets.0.init_conv.convs.0.weight'][0,0,0,0]}")
-                    if is_master:
-                        tracker.log(log_data, step=step(), verbose=True)
 
-                if is_master and last_snapshot + save_every_n_samples < sample:  # This will miss by some amount every time, but it's not a big deal... I hope
+                    if is_master:
+                        tracker.log(log_data, step=step())
+
+                if is_master and (last_snapshot + save_every_n_samples < sample or (save_immediately and i == 0)):  # This will miss by some amount every time, but it's not a big deal... I hope
                     # It is difficult to gather this kind of info on the accelerator, so we have to do it on the master
                     print("Saving snapshot")
                     last_snapshot = sample
                     # We need to know where the model should be saved
-                    save_paths = []
-                    if save_latest:
-                        save_paths.append("latest.pth")
-                    if save_all:
-                        save_paths.append(f"checkpoints/epoch_{epoch}_step_{step()}.pth")
-                    save_trainer(tracker, trainer, epoch, sample, next_task, validation_losses, save_paths)
+                    save_trainer(tracker, trainer, epoch, sample, next_task, validation_losses, samples_seen)
                     if exists(n_sample_images) and n_sample_images > 0:
                         trainer.eval()
-                        train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
+                        train_images, train_captions = generate_grid_samples(trainer, train_example_data, clip, first_trainable_unet, last_trainable_unet, condition_on_text_encodings, cond_scale, inference_device, "Train: ")
                         tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step())
                 
                 if epoch_samples is not None and sample >= epoch_samples:
@@ -376,19 +446,45 @@ def train(
             timer = Timer()
             accelerator.wait_for_everyone()
             i = 0
-            for i, (img, emb, txt) in enumerate(dataloaders["val"]):
+            for i, (img, emb, txt) in enumerate(dataloaders['val']):  # Use the accelerate prepared loader
                 val_sample_length_tensor[0] = len(img)
                 all_samples = accelerator.gather(val_sample_length_tensor)
                 total_samples = all_samples.sum().item()
                 val_sample += total_samples
-                img, emb = send_to_device((img, emb))
+                img_emb = emb.get('img')
+                has_img_embedding = img_emb is not None
+                if has_img_embedding:
+                    img_emb, = send_to_device((img_emb,))
+                text_emb = emb.get('text')
+                has_text_embedding = text_emb is not None
+                if has_text_embedding:
+                    text_emb, = send_to_device((text_emb,))
+                img, = send_to_device((img,))
 
                 for unet in range(1, len(decoder.unets)+1):
                     if not unet_training_mask[unet-1]: # Unet index is the unet number - 1
                         # No need to evaluate an unchanging unet
                         continue
-                    
-                    loss = trainer.forward(img.float(), image_embed=emb.float(), unet_number=unet)
+                        
+                    forward_params = {}
+                    if has_img_embedding:
+                        forward_params['image_embed'] = img_emb.float()
+                    else:
+                        # Forward pass automatically generates embedding
+                        assert clip is not None
+                        img_embed, img_encoding = clip.embed_image(img)
+                        forward_params['image_embed'] = img_embed
+                    if condition_on_text_encodings:
+                        if has_text_embedding:
+                            forward_params['text_encodings'] = text_emb.float()
+                        else:
+                            # Then we need to pass the text instead
+                            assert clip is not None
+                            tokenized_texts = tokenize(txt, truncate=True)
+                            assert tokenized_texts.shape[0] == len(img), f"The number of texts ({tokenized_texts.shape[0]}) should be the same as the number of images ({len(img)})"
+                            text_embed, text_encodings = clip.embed_text(tokenized_texts)
+                            forward_params['text_encodings'] = text_encodings
+                    loss = trainer.forward(img.float(), **forward_params, unet_number=unet, _device=inference_device)
                     average_val_loss_tensor[0, unet-1] += loss
 
                 if i % VALID_CALC_LOSS_EVERY_ITERS == 0:
@@ -409,15 +505,15 @@ def train(
             if is_master:
                 unet_average_val_loss = all_average_val_losses.mean(dim=0)
                 val_loss_map = { f"Unet {index} Validation Loss": loss.item() for index, loss in enumerate(unet_average_val_loss) if loss != 0 }
-                tracker.log(val_loss_map, step=step(), verbose=True)
+                tracker.log(val_loss_map, step=step())
             next_task = 'eval'
 
         if next_task == 'eval':
             if exists(evaluate_config):
                 accelerator.print(print_ribbon(f"Starting Evaluation {epoch}", repeat=40))
-                evaluation = evaluate_trainer(trainer, dataloaders["val"], inference_device, **evaluate_config.dict())
+                evaluation = evaluate_trainer(trainer, dataloaders["val"], inference_device, first_trainable_unet, last_trainable_unet, clip=clip, inference_device=inference_device, **evaluate_config.dict(), condition_on_text_encodings=condition_on_text_encodings, cond_scale=cond_scale)
                 if is_master:
-                    tracker.log(evaluation, step=step(), verbose=True)
+                    tracker.log(evaluation, step=step())
             next_task = 'sample'
             val_sample = 0
 
@@ -426,28 +522,22 @@ def train(
                 # Generate examples and save the model if we are the master
                 # Generate sample images
                 print(print_ribbon(f"Sampling Set {epoch}", repeat=40))
-                test_images, test_captions = generate_grid_samples(trainer, test_example_data, "Test: ")
-                train_images, train_captions = generate_grid_samples(trainer, train_example_data, "Train: ")
+                test_images, test_captions = generate_grid_samples(trainer, test_example_data, clip, first_trainable_unet, last_trainable_unet, condition_on_text_encodings, cond_scale, inference_device, "Test: ")
+                train_images, train_captions = generate_grid_samples(trainer, train_example_data, clip, first_trainable_unet, last_trainable_unet, condition_on_text_encodings, cond_scale, inference_device, "Train: ")
                 tracker.log_images(test_images, captions=test_captions, image_section="Test Samples", step=step())
                 tracker.log_images(train_images, captions=train_captions, image_section="Train Samples", step=step())
 
                 print(print_ribbon(f"Starting Saving {epoch}", repeat=40))
-                # Get the same paths
-                save_paths = []
-                if save_latest:
-                    save_paths.append("latest.pth")
+                is_best = False
                 if all_average_val_losses is not None:
-                    average_loss = all_average_val_losses.mean(dim=0).item()
-                    if save_best and (len(validation_losses) == 0 or average_loss < min(validation_losses)):
-                        save_paths.append("best.pth")
+                    average_loss = all_average_val_losses.mean(dim=0).sum() / sum(unet_training_mask)
+                    if len(validation_losses) == 0 or average_loss < min(validation_losses):
+                        is_best = True
                     validation_losses.append(average_loss)
-                save_trainer(tracker, trainer, epoch, sample, next_task, validation_losses, save_paths)
+                save_trainer(tracker, trainer, epoch, sample, next_task, validation_losses, samples_seen, is_best=is_best)
             next_task = 'train'
 
-def create_tracker(accelerator, config, config_path, tracker_type=None, data_path=None):
-    """
-    Creates a tracker of the specified type and initializes special features based on the full config
-    """
+def create_tracker(accelerator: Accelerator, config: TrainDecoderConfig, config_path: str, dummy: bool = False) -> Tracker:
     tracker_config = config.tracker
     accelerator_config = {
         "Distributed": accelerator.distributed_type != accelerate_dataclasses.DistributedType.NO,
@@ -455,41 +545,30 @@ def create_tracker(accelerator, config, config_path, tracker_type=None, data_pat
         "NumProcesses": accelerator.num_processes,
         "MixedPrecision": accelerator.mixed_precision
     }
-    init_config = { "config": {**config.dict(), **accelerator_config} }
-    data_path = data_path or tracker_config.data_path
-    tracker_type = tracker_type or tracker_config.tracker_type
-
-    if tracker_type == "dummy":
-        tracker = DummyTracker(data_path)
-        tracker.init(**init_config)
-    elif tracker_type == "console":
-        tracker = ConsoleTracker(data_path)
-        tracker.init(**init_config)
-    elif tracker_type == "wandb":
-        # We need to initialize the resume state here
-        load_config = config.load
-        if load_config.source == "wandb" and load_config.resume:
-            # Then we are resuming the run load_config["run_path"]
-            run_id = load_config.run_path.split("/")[-1]
-            init_config["id"] = run_id
-            init_config["resume"] = "must"
-
-        init_config["entity"] = tracker_config.wandb_entity
-        init_config["project"] = tracker_config.wandb_project
-        tracker = WandbTracker(data_path)
-        tracker.init(**init_config)
-        tracker.save_file(str(config_path.absolute()), str(config_path.parent.absolute()))
-    else:
-        raise ValueError(f"Tracker type {tracker_type} not supported by decoder trainer")
+    accelerator.wait_for_everyone()  # If nodes arrive at this point at different times they might try to autoresume the current run which makes no sense and will cause errors
+    tracker: Tracker = tracker_config.create(config, accelerator_config, dummy_mode=dummy)
+    tracker.save_config(config_path, config_name='decoder_config.json')
+    tracker.add_save_metadata(state_dict_key='config', metadata=config.dict())
     return tracker
     
-def initialize_training(config, config_path):
+def initialize_training(config: TrainDecoderConfig, config_path):
     # Make sure if we are not loading, distributed models are initialized to the same values
     torch.manual_seed(config.seed)
 
     # Set up accelerator for configurable distributed training
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=config.train.find_unused_parameters)
+    init_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=60*60))
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs, init_kwargs])
+
+    if accelerator.num_processes > 1:
+        # We are using distributed training and want to immediately ensure all can connect
+        accelerator.print("Waiting for all processes to connect...")
+        accelerator.wait_for_everyone()
+        accelerator.print("All processes online and connected")
+
+    # If we are in deepspeed fp16 mode, we must ensure learned variance is off
+    if accelerator.mixed_precision == "fp16" and accelerator.distributed_type == accelerate_dataclasses.DistributedType.DEEPSPEED and config.decoder.learned_variance:
+        raise ValueError("DeepSpeed fp16 mode does not support learned variance")
     
     # Set up data
     all_shards = list(range(config.data.start_shard, config.data.end_shard + 1))
@@ -510,21 +589,52 @@ def initialize_training(config, config_path):
         seed = config.seed,
     )
 
+    # If clip is in the model, we need to remove it for compatibility with deepspeed
+    clip = None
+    if config.decoder.clip is not None:
+        clip = config.decoder.clip.create()  # Of course we keep it to use it during training, just not in the decoder as that causes issues
+        config.decoder.clip = None
     # Create the decoder model and print basic info
     decoder = config.decoder.create()
-    num_parameters = sum(p.numel() for p in decoder.parameters())
+    get_num_parameters = lambda model, only_training=False: sum(p.numel() for p in model.parameters() if (p.requires_grad or not only_training))
 
     # Create and initialize the tracker if we are the master
-    tracker = create_tracker(accelerator, config, config_path) if rank == 0 else create_tracker(accelerator, config, config_path, tracker_type="dummy")
+    tracker = create_tracker(accelerator, config, config_path, dummy = rank!=0)
+
+    has_img_embeddings = config.data.img_embeddings_url is not None
+    has_text_embeddings = config.data.text_embeddings_url is not None
+    conditioning_on_text = any([unet.cond_on_text_encodings for unet in config.decoder.unets])
+
+    has_clip_model = clip is not None
+    data_source_string = ""
+
+    if has_img_embeddings:
+        data_source_string += "precomputed image embeddings"
+    elif has_clip_model:
+        data_source_string += "clip image embeddings generation"
+    else:
+        raise ValueError("No image embeddings source specified")
+    if conditioning_on_text:
+        if has_text_embeddings:
+            data_source_string += " and precomputed text embeddings"
+        elif has_clip_model:
+            data_source_string += " and clip text encoding generation"
+        else:
+            raise ValueError("No text embeddings source specified")
 
     accelerator.print(print_ribbon("Loaded Config", repeat=40))
     accelerator.print(f"Running training with {accelerator.num_processes} processes and {accelerator.distributed_type} distributed training")
-    accelerator.print(f"Number of parameters: {num_parameters}")
+    accelerator.print(f"Training using {data_source_string}. {'conditioned on text' if conditioning_on_text else 'not conditioned on text'}")
+    accelerator.print(f"Number of parameters: {get_num_parameters(decoder)} total; {get_num_parameters(decoder, only_training=True)} training")
+    for i, unet in enumerate(decoder.unets):
+        accelerator.print(f"Unet {i} has {get_num_parameters(unet)} total; {get_num_parameters(unet, only_training=True)} training")
+
     train(dataloaders, decoder, accelerator,
+        clip=clip,
         tracker=tracker,
         inference_device=accelerator.device,
-        load_config=config.load,
         evaluate_config=config.evaluate,
+        condition_on_text_encodings=conditioning_on_text,
         **config.train.dict(),
     )
     
