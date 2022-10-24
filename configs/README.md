@@ -30,6 +30,7 @@ Defines the configuration options for the decoder model. The unets defined above
 | `loss_type` | No | `l2` | The loss function. Options are `l1`, `huber`, or `l2`. |
 | `beta_schedule` | No | `cosine` | The noising schedule. Options are `cosine`, `linear`, `quadratic`, `jsd`, or `sigmoid`. |
 | `learned_variance` | No | `True` | Whether to learn the variance. |
+| `clip` | No | `None` | The clip model to use if embeddings are being generated on the fly. Takes keys `make` and `model` with defaults `openai` and `ViT-L/14`. |
 
 Any parameter from the `Decoder` constructor can also be given here.
 
@@ -39,7 +40,8 @@ Settings for creation of the dataloaders.
 | Option | Required | Default | Description |
 | ------ | -------- | ------- | ----------- |
 | `webdataset_base_url` | Yes | N/A | The url of a shard in the webdataset with the shard replaced with `{}`[^1]. |
-| `embeddings_url` | No | N/A | The url of the folder containing embeddings shards. Not required if embeddings are in webdataset. |
+| `img_embeddings_url` | No | `None` | The url of the folder containing image embeddings shards. Not required if embeddings are in webdataset or clip is being used. |
+| `text_embeddings_url` | No | `None` | The url of the folder containing text embeddings shards. Not required if embeddings are in webdataset or clip is being used. |
 | `num_workers` | No | `4` | The number of workers used in the dataloader. |
 | `batch_size` | No | `64` | The batch size. |
 | `start_shard` | No | `0` | Defines the start of the shard range the dataset will recall. |
@@ -67,14 +69,12 @@ Settings for controlling the training hyperparameters.
 | `wd` | No | `0.01` | The weight decay. |
 | `max_grad_norm`| No | `0.5` | The grad norm clipping. |
 | `save_every_n_samples` | No | `100000` | Samples will be generated and a checkpoint will be saved every `save_every_n_samples` samples. |
+| `cond_scale` | No | `1.0` | Conditioning scale to use for sampling. Can also be an array of values, one for each unet. |
 | `device` | No | `cuda:0` | The device to train on. |
 | `epoch_samples` | No | `None` | Limits the number of samples iterated through in each epoch. This must be set if resampling. None means no limit. |
 | `validation_samples` | No | `None` | The number of samples to use for validation. None mean the entire validation set. |
 | `use_ema` | No | `True` | Whether to use exponential moving average models for sampling. |
 | `ema_beta` | No | `0.99` | The ema coefficient. |
-| `save_all` | No | `False` | If True, preserves a checkpoint for every epoch. |
-| `save_latest` | No | `True` | If True, overwrites the `latest.pth` every time the model is saved. |
-| `save_best` | No | `True` | If True, overwrites the `best.pth` every time the model has a lower validation loss than all previous models. |
 | `unet_training_mask` | No | `None` | A boolean array of the same length as the number of unets. If false, the unet is frozen. A value of `None` trains all unets. |
 
 **<ins>Evaluate</ins>:**
@@ -91,21 +91,95 @@ Each metric can be enabled by setting its configuration. The configuration keys 
 
 **<ins>Tracker</ins>:**
 
-Selects which tracker to use and configures it.
+Selects how the experiment will be tracked.
 | Option | Required | Default | Description |
 | ------ | -------- | ------- | ----------- |
-| `tracker_type` | No | `console` | Which tracker to use. Currently accepts `console` or `wandb`. |
-| `data_path` | No | `./models` | Where the tracker will store local data. |
-| `verbose` | No | `False` | Enables console logging for non-console trackers. |
+| `data_path` | No | `./.tracker-data` | The path to the folder where temporary tracker data will be saved. |
+| `overwrite_data_path` | No | `False` | If true, the data path will be overwritten. Otherwise, you need to delete it yourself. |
+| `log` | Yes | N/A | Logging configuration. |
+| `load` | No | `None` | Checkpoint loading configuration. |
+| `save` | Yes | N/A | Checkpoint/Model saving configuration. |
+Tracking is split up into three sections:
+* Log: Where to save run metadata and image output. Options are `console` or `wandb`.
+* Load: Where to load a checkpoint from. Options are `local`, `url`, or `wandb`.
+* Save: Where to save a checkpoint to. Options are `local`, `huggingface`, or `wandb`.
 
-Other configuration options are required for the specific trackers. To see which are required, reference the initializer parameters of each [tracker](../dalle2_pytorch/trackers.py).
+**Logging:**
 
-**<ins>Load</ins>:**
-
-Selects where to load a pretrained model from.
+All loggers have the following keys:
 | Option | Required | Default | Description |
 | ------ | -------- | ------- | ----------- |
-| `source` | No | `None` | Supports `file` or `wandb`. |
-| `resume` | No | `False` | If the tracker support resuming the run, resume it. |
+| `log_type` | Yes | N/A | The type of logger class to use. |
+| `resume` | No | `False` | For loggers that have the option to resume an old run, resume it using maually input parameters. |
+| `auto_resume` | No | `False` | If true, the logger will attempt to resume an old run using parameters from that previous run. |
 
-Other configuration options are required for loading from a specific source. To see which are required, reference the load methods at the top of the [tracker file](../dalle2_pytorch/trackers.py).
+If using `console` there is no further configuration than setting `log_type` to `console`.
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `log_type` | Yes | N/A | Must be `console`. |
+
+If using `wandb`
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `log_type` | Yes | N/A | Must be `wandb`. |
+| `wandb_entity` | Yes | N/A | The wandb entity to log to. |
+| `wandb_project` | Yes | N/A | The wandb project save the run to. |
+| `wandb_run_name` | No | `None` | The wandb run name. |
+| `wandb_run_id` | No | `None` | The wandb run id. Used if resuming an old run. |
+
+**Loading:**
+
+All loaders have the following keys:
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `load_from` | Yes | N/A | The type of loader class to use. |
+| `only_auto_resume` | No | `False` | If true, the loader will only load the model if the run is being auto resumed. |
+
+If using `local`
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `load_from` | Yes | N/A | Must be `local`. |
+| `file_path` | Yes | N/A | The path to the checkpoint file. |
+
+If using `url`
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `load_from` | Yes | N/A | Must be `url`. |
+| `url` | Yes | N/A | The url of the checkpoint file. |
+
+If using `wandb`
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `load_from` | Yes | N/A | Must be `wandb`. |
+| `wandb_run_path` | No | `None` | The wandb run path. If `None`, uses the run that is being resumed. |
+| `wandb_file_path` | Yes | N/A | The path to the checkpoint file in the W&B file system. |
+
+**Saving:**
+Unlike `log` and `load`, `save` may be an array of options so that you can save to different locations in a run.
+
+All save locations have these configuration options
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `save_to` | Yes | N/A | Must be `local`, `huggingface`, or `wandb`. |
+| `save_latest_to` | No | `None` | Sets the relative path to save the latest model to. |
+| `save_best_to` | No | `None` | Sets the relative path to save the best model to every time the model has a lower validation loss than all previous models. |
+| `save_meta_to` | No | `None` | The path to save metadata files in. This includes the config files used to start the training. |
+| `save_type` | No | `checkpoint` | The type of save. `checkpoint` saves a checkpoint, `model` saves a model without any fluff (Saves with ema if ema is enabled). |
+
+If using `local`
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `save_to` | Yes | N/A | Must be `local`. |
+
+If using `huggingface`
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `save_to` | Yes | N/A | Must be `huggingface`. |
+| `huggingface_repo` | Yes | N/A | The huggingface repository to save to. |
+| `token_path` | No | `None` | If logging in with the huggingface cli is not possible, point to a token file instead. |
+
+If using `wandb`
+| Option | Required | Default | Description |
+| ------ | -------- | ------- | ----------- |
+| `save_to` | Yes | N/A | Must be `wandb`. |
+| `wandb_run_path` | No | `None` | The wandb run path. If `None`, uses the current run. You will almost always want this to be `None`. |
